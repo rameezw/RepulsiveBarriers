@@ -105,7 +105,7 @@ function sample_hold_barrier_policy(x, center_hat, all_barriers, barrier_control
     return false, 0.0, B_crit, idx_min, vals
 end
 
-function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05, T=40.0, k_override=1.0, δ=1.0, barrier_controls=nothing, umin=nothing, umax=nothing, x0=[-10.0, -10.0, π/4])
+function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05, T=40.0, k_override=1.0, δ=1.0, barrier_controls=nothing, umin=nothing, umax=nothing, x0=[-10.0, -10.0, π/2])
     N = Int(round(T / dt))
     x = copy(x0)
     K = k_override
