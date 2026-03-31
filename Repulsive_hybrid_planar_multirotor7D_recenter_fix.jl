@@ -262,23 +262,115 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
     n_override = count(barrier_override_hist)
     n_emergency_override = 0
 
-    p_traj = plot(X[1, :], X[2, :], label="system", lw=2, xlabel="x", ylabel="y", aspect_ratio=:equal)
-    plot!(p_traj, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, label="reference")
-    plot!(p_traj, obs_x, obs_y, label="obstacle center", lw=2, ls=:dot)
-    plot!(p_traj, obs_hat_x, obs_hat_y, label="recentered center", lw=2, ls=:dashdot)
-    plot!(p_traj, title="Trajectory with moving obstacle and tau-step recentering")
+    function _override_spans(flags, ts_local, dt_local)
+        spans = Tuple{Float64, Float64}[]
+        in_span = false
+        t0 = 0.0
+        for i in eachindex(flags)
+            if flags[i] && !in_span
+                in_span = true
+                t0 = ts_local[i]
+            elseif !flags[i] && in_span
+                push!(spans, (t0, ts_local[i]))
+                in_span = false
+            end
+        end
+        if in_span
+            push!(spans, (t0, ts_local[end] + dt_local))
+        end
+        return spans
+    end
 
-    p_B = plot(ts, Bcrit_hist, lw=2, label="B (active recentered barrier)", xlabel="time", ylabel="B")
-    plot!(p_B, ts, 0.0 .* Bcrit_hist, ls=:dash, lw=1.5, label="violation boundary")
-    plot!(p_B, ts, (-delta) .* ones(length(Bcrit_hist)), ls=:dot, lw=1.5, label="-delta")
-    plot!(p_B, ts, (-(delta + K)) .* ones(length(Bcrit_hist)), ls=:dot, lw=1.5, label="-delta-K")
-    plot!(p_B, title="Barrier margin")
+    override_spans = _override_spans(barrier_override_hist, ts, dt)
+    tau_steps = max(1, Int(round(tau / dt)))
+    sample_times = ts[1:tau_steps:end]
+    obs_snap_idx = unique(round.(Int, range(1, length(ts), length=min(5, length(ts)))))
+    theta_circle = LinRange(0, 2pi, 200)
 
-    p_u = plot(ts, u_nom_hist[1, :], lw=2, ls=:dash, label="u1_nom", xlabel="time", ylabel="control")
-    plot!(p_u, ts, u_app_hist[1, :], lw=2, label="u1_applied")
-    plot!(p_u, ts, u_nom_hist[2, :], lw=2, ls=:dashdot, label="u2_nom")
-    plot!(p_u, ts, u_app_hist[2, :], lw=2, label="u2_applied")
-    plot!(p_u, title="Nominal vs safety-filtered control")
+    default(
+        legendfontsize=8,
+        guidefontsize=10,
+        tickfontsize=8,
+        titlefontsize=11,
+        linewidth=2,
+        framestyle=:box,
+        gridalpha=0.18,
+        foreground_color_legend=nothing,
+        background_color_legend=RGBA(1, 1, 1, 0.85),
+        dpi=220,
+    )
+
+    p_traj = plot(
+        aspect_ratio=1,
+        xlabel="x", ylabel="y",
+        title="Workspace trajectory",
+        legend=:bottomright,
+    )
+    plot!(p_traj, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray45, label="reference")
+    plot!(p_traj, X[1, :], X[2, :], lw=2.6, color=:dodgerblue3, label="filtered trajectory")
+    plot!(p_traj, obs_x, obs_y, lw=1.8, color=:forestgreen, alpha=0.8, label="obstacle center path")
+    plot!(p_traj, obs_hat_x, obs_hat_y, lw=1.3, ls=:dashdot, color=:darkmagenta, alpha=0.8, label="recentered path")
+    scatter!(p_traj, [X[1, 1]], [X[2, 1]], marker=:circle, ms=4, color=:dodgerblue3, label="start")
+    scatter!(p_traj, [X[1, end]], [X[2, end]], marker=:star5, ms=7, color=:dodgerblue4, label="end")
+
+    for (j, idx) in enumerate(obs_snap_idx)
+        cx, cy = obs_x[idx], obs_y[idx]
+        circx = cx .+ alpha .* cos.(theta_circle)
+        circy = cy .+ alpha .* sin.(theta_circle)
+        plot!(p_traj, circx, circy, color=:orange2, ls=:dash, lw=1.4,
+            alpha=(j == length(obs_snap_idx) ? 0.9 : 0.5),
+            label=(j == 1 ? "obstacle snapshots" : ""))
+        scatter!(p_traj, [cx], [cy], color=:forestgreen, ms=3,
+            alpha=(j == length(obs_snap_idx) ? 0.9 : 0.55),
+            label=(j == 1 ? "obstacle center" : ""))
+    end
+
+    p_B = plot(ts, Bcrit_hist, lw=2.2, color=:dodgerblue3,
+        label="active barrier", xlabel="time", ylabel="B", title="Barrier margin", legend=:bottomright)
+    hline!(p_B, [0.0], color=:orangered2, ls=:dash, lw=1.8, label="0")
+    hline!(p_B, [-delta], color=:forestgreen, ls=:dot, lw=1.8, label="-δ")
+    hline!(p_B, [-(delta + K)], color=:darkorchid2, ls=:dashdot, lw=1.8, label="-δ-K")
+    for (a, b) in override_spans
+        vspan!(p_B, [a, b], color=:gray85, alpha=0.35, label=false)
+    end
+    for tmark in sample_times
+        vline!(p_B, [tmark], color=:gray70, lw=0.7, ls=:dot, alpha=0.35, label=false)
+    end
+
+    u1_nominal_only = [barrier_override_hist[i] ? NaN : u_app_hist[1, i] for i in eachindex(ts)]
+    u1_override_only = [barrier_override_hist[i] ? u_app_hist[1, i] : NaN for i in eachindex(ts)]
+    u2_nominal_only = [barrier_override_hist[i] ? NaN : u_app_hist[2, i] for i in eachindex(ts)]
+    u2_override_only = [barrier_override_hist[i] ? u_app_hist[2, i] : NaN for i in eachindex(ts)]
+
+    p_u = plot(
+        ts,
+        u1_nominal_only,
+        lw=2.0,
+        color=:deepskyblue3,
+        label="u1 applied (nominal mode)",
+        xlabel="time",
+        ylabel="control",
+        title="Applied controls by mode",
+        legend=:bottomright,
+    )
+    plot!(p_u, ts, u1_override_only, lw=2.0, color=:orangered3, label="u1 applied (override mode)")
+    plot!(p_u, ts, u2_nominal_only, lw=1.8, color=:teal, ls=:dash, label="u2 applied (nominal mode)")
+    plot!(p_u, ts, u2_override_only, lw=1.8, color=:orange, ls=:dash, label="u2 applied (override mode)")
+    for (a, b) in override_spans
+        vspan!(p_u, [a, b], color=:gray85, alpha=0.35, label=false)
+    end
+
+    p_combined = plot(
+        p_traj, p_B, p_u,
+        layout=@layout([a{0.95w} ; b{0.6w} ; c{0.55w}]),
+        size=(900, 1100),
+    )
+
+    mkpath("figures")
+    savefig(p_traj, "figures/multirotor_traj.pdf")
+    savefig(p_B, "figures/multirotor_barrier.pdf")
+    savefig(p_u, "figures/multirotor_control.pdf")
+    savefig(p_combined, "figures/multirotor_results_combined.pdf")
 
     x_all = vcat(X[1, :], obs_x)
     y_all = vcat(X[2, :], obs_y)
@@ -288,13 +380,13 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
     ylims_anim = (minimum(y_all) - y_margin, maximum(y_all) + y_margin)
 
     obs_radius = alpha
-    θ = LinRange(0, 2pi, 120)
+    θ = LinRange(0, 2pi, 160)
 
     anim = @animate for k in 1:4:N
-        p = plot(xlim=xlims_anim, ylim=ylims_anim, aspect_ratio=:equal, xlabel="x", ylabel="y", title="Planar multirotor with moving obstacle")
+        p = plot(xlim=xlims_anim, ylim=ylims_anim, aspect_ratio=:equal, xlabel="x", ylabel="y", title="Repulsive barrier simulation (moving obstacle)")
         plot!(p, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray, label="reference")
         plot!(p, X[1, 1:k], X[2, 1:k], label="system", lw=2.5, color=:blue)
-        if barrier_override_hist[min(k, end)]
+        if k > 1 && barrier_override_hist[min(k - 1, end)]
             scatter!(p, [X[1, k]], [X[2, k]], label="barrier override", color=:red, markersize=5)
         else
             scatter!(p, [X[1, k]], [X[2, k]], label="state", color=:blue, markersize=5)
@@ -305,11 +397,11 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
         obs_px = cx .+ obs_radius .* cos.(θ)
         obs_py = cy .+ obs_radius .* sin.(θ)
         plot!(p, obs_px, obs_py, label="obstacle", lw=2, color=:black)
-        scatter!(p, [cx], [cy], label="obs center", color=:red, markersize=4)
+        scatter!(p, [cx], [cy], label="obs center", color=:black, markersize=4)
         scatter!(p, [hx], [hy], label="recentered", marker=:x, color=:magenta, markersize=5)
         annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.06 * (ylims_anim[2] - ylims_anim[1]), text("t = $(round(ts[k], digits=2)) s", 9))
-        annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.12 * (ylims_anim[2] - ylims_anim[1]), text("B = $(round(Bcrit_hist[min(k, end)], digits=3))", 9))
-        mode_str = barrier_override_hist[min(k, end)] ? "override" : "nominal"
+        annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.12 * (ylims_anim[2] - ylims_anim[1]), text("B = $(round(Bcrit_hist[min(max(k - 1, 1), end)], digits=3))", 9))
+        mode_str = (k > 1 && barrier_override_hist[min(k - 1, end)]) ? "override" : "nominal"
         annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.18 * (ylims_anim[2] - ylims_anim[1]), text("mode = $mode_str", 9))
         p
     end
