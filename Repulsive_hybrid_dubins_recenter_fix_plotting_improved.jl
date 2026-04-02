@@ -301,11 +301,27 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
     hline!(p_B, [0.0], color=:orangered2, ls=:dash, lw=1.8, label="0")
     hline!(p_B, [-δ], color=:forestgreen, ls=:dot, lw=1.8, label="-δ")
     hline!(p_B, [-(δ + K)], color=:darkorchid2, ls=:dashdot, lw=1.8, label="-δ-K")
-    for (a, b) in override_spans
-        vspan!(p_B, [a, b], color=:gray85, alpha=0.35, label=false)
-    end
-    for tmark in sample_times
-        vline!(p_B, [tmark], color=:gray70, lw=0.7, ls=:dot, alpha=0.35, label=false)
+
+    # Replace dense guide lines with compact bottom markers to reduce visual clutter.
+    b_min = minimum(B_hist)
+    b_max = maximum(B_hist)
+    b_span = max(b_max - b_min, 1e-3)
+    marker_base = b_min - 0.04 * b_span
+    marker_upper = b_min - 0.015 * b_span
+
+    n_sample_markers = min(length(sample_times), 36)
+    sample_stride = max(1, Int(ceil(length(sample_times) / max(n_sample_markers, 1))))
+    sample_marker_times = sample_times[1:sample_stride:end]
+    scatter!(p_B, sample_marker_times, fill(marker_base, length(sample_marker_times));
+        ms=1.6, marker=:circle, color=:gray55, alpha=0.35, label=false)
+
+    override_times = ts_hist[barrier_override_hist]
+    if !isempty(override_times)
+        n_override_markers = min(length(override_times), 60)
+        override_stride = max(1, Int(ceil(length(override_times) / max(n_override_markers, 1))))
+        override_marker_times = override_times[1:override_stride:end]
+        scatter!(p_B, override_marker_times, fill(marker_upper, length(override_marker_times));
+            ms=2.0, marker=:utriangle, color=:darkorange2, alpha=0.60, markerstrokewidth=0.0, label="override markers")
     end
 
     # Show a single applied control trace, color-coded by execution mode.
@@ -314,18 +330,28 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
 
     p_u = plot(
         ts_hist,
-        u_nominal_only,
-        lw=2.0,
-        color=:deepskyblue3,
-        label="u_applied (nominal mode)",
+        u_hist,
+        lw=1.2,
+        color=:gray45,
+        alpha=0.45,
+        label="u_applied",
         xlabel="time",
         ylabel="turn-rate",
         title="Applied control by mode",
         legend=:bottomright,
     )
-    plot!(p_u, ts_hist, u_override_only, lw=2.0, color=:orangered3, label="u_applied (override mode)")
-    for (a, b) in override_spans
-        vspan!(p_u, [a, b], color=:gray85, alpha=0.35, label=false)
+    plot!(p_u, ts_hist, u_nominal_only, lw=2.0, color=:deepskyblue3, label="u_applied (nominal mode)")
+
+    override_vals = u_hist[barrier_override_hist]
+    if !isempty(override_times)
+        n_override_ctrl_markers = min(length(override_times), 120)
+        override_ctrl_stride = max(1, Int(ceil(length(override_times) / max(n_override_ctrl_markers, 1))))
+        override_ctrl_times = override_times[1:override_ctrl_stride:end]
+        override_ctrl_vals = override_vals[1:override_ctrl_stride:end]
+        scatter!(p_u, override_ctrl_times, override_ctrl_vals,
+            ms=2.2, marker=:utriangle, color=:orangered3, alpha=0.65, markerstrokewidth=0.0, label="u_applied (override mode)")
+    else
+        plot!(p_u, ts_hist, u_override_only, lw=2.0, color=:orangered3, label="u_applied (override mode)")
     end
 
     p_combined = plot(

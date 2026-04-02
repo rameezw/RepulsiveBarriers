@@ -16,14 +16,56 @@ function make_obstacle_trajectory(v_obs::Tuple{Float64, Float64}, x0_obs::Tuple{
 end
 
 function reference_state(t::Float64; p_start::Tuple{Float64, Float64}=(-10.0, -10.0), p_end::Tuple{Float64, Float64}=(10.0, 10.0), T_ref::Float64=6.5)
-    alpha = clamp(t / T_ref, 0.0, 1.0)
+    return reference_state(t;
+        ref_style=:line,
+        p_start=p_start,
+        p_end=p_end,
+        T_ref=T_ref,
+        lazy8_center=(0.0, 0.0),
+        lazy8_scale=(8.0, 5.0),
+        lazy8_cycles=1.0,
+        lazy8_phase=0.0,
+    )
+end
+
+function reference_state(t::Float64;
+    ref_style::Symbol=:line,
+    p_start::Tuple{Float64, Float64}=(-10.0, -10.0),
+    p_end::Tuple{Float64, Float64}=(10.0, 10.0),
+    T_ref::Float64=6.5,
+    lazy8_center::Tuple{Float64, Float64}=(0.0, 0.0),
+    lazy8_scale::Tuple{Float64, Float64}=(8.0, 5.0),
+    lazy8_cycles::Float64=1.0,
+    lazy8_phase::Float64=0.0)
+
+    if ref_style == :lazy8
+        ω = (2pi * lazy8_cycles) / max(T_ref, 1e-6)
+        σ = ω * t + lazy8_phase
+
+        cx, cy = lazy8_center
+        a, b = lazy8_scale
+        r = [
+            cx + a * sin(σ),
+            cy + b * sin(σ) * cos(σ),
+        ]
+        r_dot = [
+            a * ω * cos(σ),
+            b * ω * cos(2.0 * σ),
+        ]
+        return r, r_dot
+    end
+
+    alpha = clamp(t / max(T_ref, 1e-6), 0.0, 1.0)
+    s = alpha^2 * (3.0 - 2.0 * alpha)
+    ds_dt = (0.0 < t < T_ref) ? (6.0 * alpha * (1.0 - alpha) / max(T_ref, 1e-6)) : 0.0
+
     r = [
-        (1.0 - alpha) * p_start[1] + alpha * p_end[1],
-        (1.0 - alpha) * p_start[2] + alpha * p_end[2],
+        (1.0 - s) * p_start[1] + s * p_end[1],
+        (1.0 - s) * p_start[2] + s * p_end[2],
     ]
     r_dot = [
-        (p_end[1] - p_start[1]) / T_ref,
-        (p_end[2] - p_start[2]) / T_ref,
+        ds_dt * (p_end[1] - p_start[1]),
+        ds_dt * (p_end[2] - p_start[2]),
     ]
     return r, r_dot
 end
@@ -42,6 +84,28 @@ function critical_barrier(Bs::Vector, xhat::AbstractVector{<:Real})
     return vals[idx], idx, vals
 end
 
+function choose_best_override_control(xk::Vector{Float64}, c_hat::Vector{Float64}, U::Vector{Vector{Float64}}, Bs::Vector, dt::Float64;
+    u_nom::Tuple{Float64, Float64}=(0.0, 0.0),
+    u_track_weight::Float64=0.03)
+
+    best_u = (U[1][1], U[1][2])
+    best_score = Inf
+    for ui in U
+        u = (ui[1], ui[2])
+        xnext = xk .+ dt .* dynamics_rhs(xk, u)
+        xnext[5] = atan(sin(xnext[5]), cos(xnext[5]))
+        xhat_next = recenter_state(xnext, c_hat)
+        b_next, _, _ = critical_barrier(Bs, xhat_next)
+        track_pen = u_track_weight * ((u[1] - u_nom[1])^2 + (u[2] - u_nom[2])^2)
+        score = b_next + track_pen
+        if score < best_score
+            best_score = score
+            best_u = u
+        end
+    end
+    return best_u, best_score
+end
+
 function in_region(theta::Float64, idx::Int)
     lb = (idx - 3) * pi / 2
     ub = (idx - 2) * pi / 2
@@ -51,24 +115,26 @@ end
 function dynamics_rhs(x::Vector{Float64}, u::Tuple{Float64, Float64})
     u1, u2 = u
     theta = x[5]
+    err = x[7]
+    usum = u1 + u2
 
     dx = zeros(Float64, 7)
     dx[1] = x[3]
     dx[2] = x[4]
 
-    # Keep the same piecewise planar multirotor model as in the notebook.
+    # Match the exact piecewise planar multirotor dynamics used during synthesis.
     if theta <= -pi/2
-        dx[3] = (u1 + u2) * (sin(theta) - (4.0/pi^2) * theta^2 - (4.0/pi) * theta)
-        dx[4] = (u1 + u2) * ((2.0/pi) * theta + 2.0) - 2.0
+        dx[3] = usum * (-2.0 / pi) * (theta + pi) - 0.2 * err
+        dx[4] = usum * ((2.0 / pi) * (theta + pi / 2.0) - 0.2 * err) - 2.0
     elseif theta <= 0.0
-        dx[3] = (u1 + u2) * (sin(theta) + (4.0/pi^2) * theta^2 + (4.0/pi) * theta)
-        dx[4] = (u1 + u2) * ((2.0/pi) * theta + 2.0) - 2.0
+        dx[3] = usum * (2.0 / pi) * theta + 0.2 * err
+        dx[4] = usum * ((2.0 / pi) * (theta + pi / 2.0) - 0.2 * err) - 2.0
     elseif theta <= pi/2
-        dx[3] = (u1 + u2) * (sin(theta) - (4.0/pi^2) * theta^2 + (4.0/pi) * theta)
-        dx[4] = (u1 + u2) * (-(2.0/pi) * theta + 2.0) - 2.0
+        dx[3] = usum * (2.0 / pi) * theta + 0.2 * err
+        dx[4] = usum * ((-2.0 / pi) * (theta - pi / 2.0) + 0.2 * err) - 2.0
     else
-        dx[3] = (u1 + u2) * (sin(theta) + (4.0/pi^2) * theta^2 - (4.0/pi) * theta)
-        dx[4] = (u1 + u2) * (-(2.0/pi) * theta + 2.0) - 2.0
+        dx[3] = usum * (-2.0 / pi) * (theta - pi) - 0.2 * err
+        dx[4] = usum * ((-2.0 / pi) * (theta - pi / 2.0) + 0.2 * err) - 2.0
     end
 
     dx[5] = x[6]
@@ -77,43 +143,64 @@ function dynamics_rhs(x::Vector{Float64}, u::Tuple{Float64, Float64})
     return dx
 end
 
-function nominal_controller(x::Vector{Float64}, t::Float64; umax::Float64=2.0, ref_start::Tuple{Float64, Float64}=(-10.0, -10.0), ref_end::Tuple{Float64, Float64}=(10.0, 10.0), ref_T::Float64=6.5)
-    r, _ = reference_state(t; p_start=ref_start, p_end=ref_end, T_ref=ref_T)
-    xr, yr = r
-    ex = xr - x[1]
-    ey = yr - x[2]
+function nominal_controller(x::Vector{Float64}, t::Float64;
+    umax::Float64=2.0,
+    ref_style::Symbol=:line,
+    ref_start::Tuple{Float64, Float64}=(-10.0, -10.0),
+    ref_end::Tuple{Float64, Float64}=(10.0, 10.0),
+    ref_T::Float64=6.5,
+    lazy8_center::Tuple{Float64, Float64}=(0.0, 0.0),
+    lazy8_scale::Tuple{Float64, Float64}=(8.0, 5.0),
+    lazy8_cycles::Float64=1.0,
+    lazy8_phase::Float64=0.0,
+    dt_nom::Float64=0.12)
 
-    ax_des = 1.2 * ex - 0.8 * x[3]
-    ay_des = 1.2 * ey - 0.8 * x[4]
+    r, r_dot = reference_state(t + 4.0 * dt_nom;
+        ref_style=ref_style,
+        p_start=ref_start,
+        p_end=ref_end,
+        T_ref=ref_T,
+        lazy8_center=lazy8_center,
+        lazy8_scale=lazy8_scale,
+        lazy8_cycles=lazy8_cycles,
+        lazy8_phase=lazy8_phase)
+    ex = r[1] - x[1]
+    ey = r[2] - x[2]
+    evx = r_dot[1] - x[3]
+    evy = r_dot[2] - x[4]
 
+    # Piecewise dynamics lose vertical effectiveness as |theta| grows. Compensate this loss.
     theta = x[5]
-    if theta <= -pi/2
-        fx = sin(theta) - (4.0/pi^2) * theta^2 - (4.0/pi) * theta
-        fy = (2.0/pi) * theta + 2.0
+    lift_gain = if theta <= -pi/2
+        (-2.0 / pi) * (theta + pi / 2.0)
     elseif theta <= 0.0
-        fx = sin(theta) + (4.0/pi^2) * theta^2 + (4.0/pi) * theta
-        fy = (2.0/pi) * theta + 2.0
+        (2.0 / pi) * (theta + pi / 2.0)
     elseif theta <= pi/2
-        fx = sin(theta) - (4.0/pi^2) * theta^2 + (4.0/pi) * theta
-        fy = -(2.0/pi) * theta + 2.0
+        (-2.0 / pi) * (theta - pi / 2.0)
     else
-        fx = sin(theta) + (4.0/pi^2) * theta^2 - (4.0/pi) * theta
-        fy = -(2.0/pi) * theta + 2.0
+        (2.0 / pi) * (theta - pi / 2.0)
     end
+    lift_gain = clamp(lift_gain, 0.35, 1.0)
 
-    # Keep a hover-capable baseline thrust while tracking x/y with small corrections.
-    sum_hover = (2.0 + 0.9 * ey - 0.5 * x[4]) / max(abs(fy), 0.4)
-    sum_from_x = ax_des / max(abs(fx), 0.3) * sign(fx)
-    sum_u = clamp(0.8 * sum_hover + 0.2 * sum_from_x, 1.0, 2.0 * umax)
+    sum_u_raw = 2.0 + 0.70 * ey + 0.45 * evy
+    sum_u = clamp(sum_u_raw / lift_gain, 0.7, 3.0)
 
-    theta_ref = clamp(0.25 * ax_des, -0.7, 0.7)
-    dtheta = theta_ref - x[5]
-    domega = -1.0 * x[6] + 1.4 * dtheta
-    diff_u = clamp(domega, -0.9 * umax, 0.9 * umax)
+    theta_ref = clamp(0.10 * ex + 0.06 * evx, -0.5, 0.5)
+    theta_err = atan(sin(theta_ref - x[5]), cos(theta_ref - x[5]))
+    diff_u = clamp(1.2 * theta_err - 0.9 * x[6], -0.55, 0.55)
 
-    min_rotor = 0.45
-    u1 = clamp(0.5 * (sum_u + diff_u), min_rotor, umax)
-    u2 = clamp(0.5 * (sum_u - diff_u), min_rotor, umax)
+    u_floor = 0.35
+    u1 = clamp(0.5 * (sum_u + diff_u), u_floor, umax)
+    u2 = clamp(0.5 * (sum_u - diff_u), u_floor, umax)
+
+    # Keep realized total thrust close to the intended sum_u after clamping.
+    sum_real = u1 + u2
+    sum_target = max(0.85 * sum_u, 2.0 * u_floor)
+    if sum_real < sum_target
+        boost = 0.5 * (sum_target - sum_real)
+        u1 = clamp(u1 + boost, u_floor, umax)
+        u2 = clamp(u2 + boost, u_floor, umax)
+    end
     return (u1, u2)
 end
 
@@ -141,19 +228,33 @@ function select_emergency_control(xk::Vector{Float64}, c_true::Vector{Float64}, 
     return best_u
 end
 
-function run_repulsive_hybrid_planar_multirotor_demo(; 
+function run_repulsive_hybrid_planar_multirotor_demo(;
     Bs::Vector,
     U::Vector{Vector{Float64}},
     K::Float64=1.0,
     delta::Float64=1.0,
     alpha::Float64=0.1,
     tau::Float64=0.1,
+    tau_steps=nothing,
+    override_B_threshold=nothing,
+    override_B_hysteresis::Float64=0.0,
+    override_dist_trigger::Float64=Inf,
+    override_dist_release=nothing,
+    strict_delta_enforcement::Bool=false,
+    strict_delta_hysteresis::Float64=0.0,
+    strict_u_track_weight::Float64=0.03,
+    make_plots::Bool=true,
     dt::Float64=0.01,
     T::Float64=20.0,
     x0::Vector{Float64}=[-10.0, -10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    ref_style::Symbol=:line,
     ref_start::Tuple{Float64, Float64}=(-10.0, -10.0),
     ref_end::Tuple{Float64, Float64}=(10.0, 10.0),
     ref_T::Float64=T,
+    lazy8_center::Tuple{Float64, Float64}=(0.0, 0.0),
+    lazy8_scale::Tuple{Float64, Float64}=(8.0, 5.0),
+    lazy8_cycles::Float64=1.0,
+    lazy8_phase::Float64=0.0,
     state_bounds::Vector{Tuple{Float64, Float64}}=[(-10.0, 10.0), (-10.0, 10.0), (-10.0, 10.0), (-10.0, 10.0), (-Float64(pi), Float64(pi)), (-10.0, 10.0), (-1.0, 1.0)],
     v_obs::Tuple{Float64, Float64}=(0.12, 0.06),
     x0_obs::Tuple{Float64, Float64}=(-1.5, 0.0),
@@ -177,12 +278,31 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
     ref_hist = zeros(Float64, 2, N)
     track_err_hist = zeros(Float64, N)
 
-    hold_u = nominal_controller(collect(x0), 0.0; ref_start=ref_start, ref_end=ref_end, ref_T=ref_T)
+    hold_u = nominal_controller(collect(x0), 0.0;
+        ref_style=ref_style,
+        ref_start=ref_start,
+        ref_end=ref_end,
+        ref_T=ref_T,
+        lazy8_center=lazy8_center,
+        lazy8_scale=lazy8_scale,
+        lazy8_cycles=lazy8_cycles,
+        lazy8_phase=lazy8_phase)
     hold_override = false
     hold_count = 0
-    hold_horizon = max(1, Int(round(tau / dt)))
+    hold_horizon = isnothing(tau_steps) ? max(1, Int(round(tau / dt))) : max(1, Int(tau_steps))
+    enter_thresh = isnothing(override_B_threshold) ? -(delta + K) : override_B_threshold
+    exit_thresh = enter_thresh - abs(override_B_hysteresis)
+    dist_release = isnothing(override_dist_release) ? override_dist_trigger : override_dist_release
     obs_hat = obs(0.0)
-    ref_hist[:, 1] .= reference_state(0.0; p_start=ref_start, p_end=ref_end, T_ref=ref_T)[1]
+    ref_hist[:, 1] .= reference_state(0.0;
+        ref_style=ref_style,
+        p_start=ref_start,
+        p_end=ref_end,
+        T_ref=ref_T,
+        lazy8_center=lazy8_center,
+        lazy8_scale=lazy8_scale,
+        lazy8_cycles=lazy8_cycles,
+        lazy8_phase=lazy8_phase)[1]
 
     for k in 1:(N - 1)
         t = ts[k]
@@ -201,22 +321,58 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
             B_hist[i, k] = eval_barrier(Bs[i], xhat)
         end
 
-        u_nom = nominal_controller(xk, t; ref_start=ref_start, ref_end=ref_end, ref_T=ref_T)
+        u_nom = nominal_controller(xk, t;
+            ref_style=ref_style,
+            ref_start=ref_start,
+            ref_end=ref_end,
+            ref_T=ref_T,
+            lazy8_center=lazy8_center,
+            lazy8_scale=lazy8_scale,
+            lazy8_cycles=lazy8_cycles,
+            lazy8_phase=lazy8_phase,
+            dt_nom=max(4.0 * dt, 0.08))
         u_nom_hist[:, k] .= [u_nom[1], u_nom[2]]
 
         if hold_count <= 0
-            take_over, u_safe, Bcrit, _, _ = select_safe_control(xhat, U, Bs, delta, K)
-            if take_over
-                hold_u = u_safe
-                hold_override = true
-            else
+            if !hold_override
                 hold_u = u_nom
-                hold_override = false
+            end
+
+            Bcrit, idx_crit, _ = critical_barrier(Bs, xhat)
+            d_hat = hypot(xk[1] - obs_hat[1], xk[2] - obs_hat[2])
+
+            if strict_delta_enforcement
+                strict_exit = -delta - abs(strict_delta_hysteresis)
+                if Bcrit > -delta
+                    hold_override = true
+                    hold_u, _ = choose_best_override_control(xk, obs_hat, U, Bs, dt;
+                        u_nom=u_nom,
+                        u_track_weight=strict_u_track_weight)
+                elseif hold_override && (Bcrit <= strict_exit)
+                    hold_override = false
+                    hold_u = (0.0, 0.0)
+                end
+            else
+                if hold_override
+                    if (Bcrit <= exit_thresh) || (d_hat >= dist_release)
+                        hold_override = false
+                        hold_u = u_nom
+                    else
+                        hold_u, _ = choose_best_override_control(xk, obs_hat, U, Bs, dt;
+                            u_nom=u_nom,
+                            u_track_weight=0.03)
+                    end
+                elseif (d_hat <= override_dist_trigger) && (Bcrit > enter_thresh)
+                    hold_override = true
+                    hold_u = (U[idx_crit][1], U[idx_crit][2])
+                else
+                    hold_u = u_nom
+                end
             end
             Bcrit_hist[k] = Bcrit
             hold_count = hold_horizon
         else
-            _, _, Bcrit, _, _ = select_safe_control(xhat, U, Bs, delta, K)
+            Bcrit, _, _ = critical_barrier(Bs, xhat)
             Bcrit_hist[k] = Bcrit
         end
 
@@ -235,7 +391,15 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
         X[6, k + 1] = clamp(X[6, k + 1], state_bounds[6][1], state_bounds[6][2])
         X[7, k + 1] = clamp(X[7, k + 1], state_bounds[7][1], state_bounds[7][2])
 
-        ref_hist[:, k + 1] .= reference_state(t + dt; p_start=ref_start, p_end=ref_end, T_ref=ref_T)[1]
+        ref_hist[:, k + 1] .= reference_state(t + dt;
+            ref_style=ref_style,
+            p_start=ref_start,
+            p_end=ref_end,
+            T_ref=ref_T,
+            lazy8_center=lazy8_center,
+            lazy8_scale=lazy8_scale,
+            lazy8_cycles=lazy8_cycles,
+            lazy8_phase=lazy8_phase)[1]
         track_err_hist[k] = hypot(X[1, k] - ref_hist[1, k], X[2, k] - ref_hist[2, k])
     end
 
@@ -287,126 +451,150 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
     obs_snap_idx = unique(round.(Int, range(1, length(ts), length=min(5, length(ts)))))
     theta_circle = LinRange(0, 2pi, 200)
 
-    default(
-        legendfontsize=8,
-        guidefontsize=10,
-        tickfontsize=8,
-        titlefontsize=11,
-        linewidth=2,
-        framestyle=:box,
-        gridalpha=0.18,
-        foreground_color_legend=nothing,
-        background_color_legend=RGBA(1, 1, 1, 0.85),
-        dpi=220,
-    )
+    p_traj = nothing
+    p_B = nothing
+    p_u = nothing
+    p_combined = nothing
+    p_anim = nothing
 
-    p_traj = plot(
-        aspect_ratio=1,
-        xlabel="x", ylabel="y",
-        title="Workspace trajectory",
-        legend=:bottomright,
-    )
-    plot!(p_traj, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray45, label="reference")
-    plot!(p_traj, X[1, :], X[2, :], lw=2.6, color=:dodgerblue3, label="filtered trajectory")
-    plot!(p_traj, obs_x, obs_y, lw=1.8, color=:forestgreen, alpha=0.8, label="obstacle center path")
-    plot!(p_traj, obs_hat_x, obs_hat_y, lw=1.3, ls=:dashdot, color=:darkmagenta, alpha=0.8, label="recentered path")
-    scatter!(p_traj, [X[1, 1]], [X[2, 1]], marker=:circle, ms=4, color=:dodgerblue3, label="start")
-    scatter!(p_traj, [X[1, end]], [X[2, end]], marker=:star5, ms=7, color=:dodgerblue4, label="end")
+    if make_plots
+        default(
+            legendfontsize=8,
+            guidefontsize=10,
+            tickfontsize=8,
+            titlefontsize=11,
+            linewidth=2,
+            framestyle=:box,
+            gridalpha=0.18,
+            foreground_color_legend=nothing,
+            background_color_legend=RGBA(1, 1, 1, 0.85),
+            dpi=220,
+        )
 
-    for (j, idx) in enumerate(obs_snap_idx)
-        cx, cy = obs_x[idx], obs_y[idx]
-        circx = cx .+ alpha .* cos.(theta_circle)
-        circy = cy .+ alpha .* sin.(theta_circle)
-        plot!(p_traj, circx, circy, color=:orange2, ls=:dash, lw=1.4,
-            alpha=(j == length(obs_snap_idx) ? 0.9 : 0.5),
-            label=(j == 1 ? "obstacle snapshots" : ""))
-        scatter!(p_traj, [cx], [cy], color=:forestgreen, ms=3,
-            alpha=(j == length(obs_snap_idx) ? 0.9 : 0.55),
-            label=(j == 1 ? "obstacle center" : ""))
-    end
+        p_traj = plot(
+            aspect_ratio=1,
+            xlabel="x", ylabel="y",
+            title="Workspace trajectory",
+            legend=:bottomright,
+        )
+        plot!(p_traj, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray45, label="reference")
+        plot!(p_traj, X[1, :], X[2, :], lw=2.6, color=:dodgerblue3, label="filtered trajectory")
+        plot!(p_traj, obs_x, obs_y, lw=1.8, color=:forestgreen, alpha=0.8, label="obstacle center path")
+        plot!(p_traj, obs_hat_x, obs_hat_y, lw=1.3, ls=:dashdot, color=:darkmagenta, alpha=0.8, label="recentered path")
+        scatter!(p_traj, [X[1, 1]], [X[2, 1]], marker=:circle, ms=4, color=:dodgerblue3, label="start")
+        scatter!(p_traj, [X[1, end]], [X[2, end]], marker=:star5, ms=7, color=:dodgerblue4, label="end")
 
-    p_B = plot(ts, Bcrit_hist, lw=2.2, color=:dodgerblue3,
-        label="active barrier", xlabel="time", ylabel="B", title="Barrier margin", legend=:bottomright)
-    hline!(p_B, [0.0], color=:orangered2, ls=:dash, lw=1.8, label="0")
-    hline!(p_B, [-delta], color=:forestgreen, ls=:dot, lw=1.8, label="-δ")
-    hline!(p_B, [-(delta + K)], color=:darkorchid2, ls=:dashdot, lw=1.8, label="-δ-K")
-    for (a, b) in override_spans
-        vspan!(p_B, [a, b], color=:gray85, alpha=0.35, label=false)
-    end
-    for tmark in sample_times
-        vline!(p_B, [tmark], color=:gray70, lw=0.7, ls=:dot, alpha=0.35, label=false)
-    end
-
-    u1_nominal_only = [barrier_override_hist[i] ? NaN : u_app_hist[1, i] for i in eachindex(ts)]
-    u1_override_only = [barrier_override_hist[i] ? u_app_hist[1, i] : NaN for i in eachindex(ts)]
-    u2_nominal_only = [barrier_override_hist[i] ? NaN : u_app_hist[2, i] for i in eachindex(ts)]
-    u2_override_only = [barrier_override_hist[i] ? u_app_hist[2, i] : NaN for i in eachindex(ts)]
-
-    p_u = plot(
-        ts,
-        u1_nominal_only,
-        lw=2.0,
-        color=:deepskyblue3,
-        label="u1 applied (nominal mode)",
-        xlabel="time",
-        ylabel="control",
-        title="Applied controls by mode",
-        legend=:bottomright,
-    )
-    plot!(p_u, ts, u1_override_only, lw=2.0, color=:orangered3, label="u1 applied (override mode)")
-    plot!(p_u, ts, u2_nominal_only, lw=1.8, color=:teal, ls=:dash, label="u2 applied (nominal mode)")
-    plot!(p_u, ts, u2_override_only, lw=1.8, color=:orange, ls=:dash, label="u2 applied (override mode)")
-    for (a, b) in override_spans
-        vspan!(p_u, [a, b], color=:gray85, alpha=0.35, label=false)
-    end
-
-    p_combined = plot(
-        p_traj, p_B, p_u,
-        layout=@layout([a{0.95w} ; b{0.6w} ; c{0.55w}]),
-        size=(900, 1100),
-    )
-
-    mkpath("figures")
-    savefig(p_traj, "figures/multirotor_traj.pdf")
-    savefig(p_B, "figures/multirotor_barrier.pdf")
-    savefig(p_u, "figures/multirotor_control.pdf")
-    savefig(p_combined, "figures/multirotor_results_combined.pdf")
-
-    x_all = vcat(X[1, :], obs_x)
-    y_all = vcat(X[2, :], obs_y)
-    x_margin = 0.15 * max(maximum(x_all) - minimum(x_all), 1.0)
-    y_margin = 0.15 * max(maximum(y_all) - minimum(y_all), 1.0)
-    xlims_anim = (minimum(x_all) - x_margin, maximum(x_all) + x_margin)
-    ylims_anim = (minimum(y_all) - y_margin, maximum(y_all) + y_margin)
-
-    obs_radius = alpha
-    θ = LinRange(0, 2pi, 160)
-
-    anim = @animate for k in 1:4:N
-        p = plot(xlim=xlims_anim, ylim=ylims_anim, aspect_ratio=:equal, xlabel="x", ylabel="y", title="Repulsive barrier simulation (moving obstacle)")
-        plot!(p, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray, label="reference")
-        plot!(p, X[1, 1:k], X[2, 1:k], label="system", lw=2.5, color=:blue)
-        if k > 1 && barrier_override_hist[min(k - 1, end)]
-            scatter!(p, [X[1, k]], [X[2, k]], label="barrier override", color=:red, markersize=5)
-        else
-            scatter!(p, [X[1, k]], [X[2, k]], label="state", color=:blue, markersize=5)
+        for (j, idx) in enumerate(obs_snap_idx)
+            cx, cy = obs_x[idx], obs_y[idx]
+            circx = cx .+ alpha .* cos.(theta_circle)
+            circy = cy .+ alpha .* sin.(theta_circle)
+            plot!(p_traj, circx, circy, color=:orange2, ls=:dash, lw=1.4,
+                alpha=(j == length(obs_snap_idx) ? 0.9 : 0.5),
+                label=(j == 1 ? "obstacle snapshots" : ""))
+            scatter!(p_traj, [cx], [cy], color=:forestgreen, ms=3,
+                alpha=(j == length(obs_snap_idx) ? 0.9 : 0.55),
+                label=(j == 1 ? "obstacle center" : ""))
         end
 
-        cx, cy = obs_x[k], obs_y[k]
-        hx, hy = obs_hat_x[k], obs_hat_y[k]
-        obs_px = cx .+ obs_radius .* cos.(θ)
-        obs_py = cy .+ obs_radius .* sin.(θ)
-        plot!(p, obs_px, obs_py, label="obstacle", lw=2, color=:black)
-        scatter!(p, [cx], [cy], label="obs center", color=:black, markersize=4)
-        scatter!(p, [hx], [hy], label="recentered", marker=:x, color=:magenta, markersize=5)
-        annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.06 * (ylims_anim[2] - ylims_anim[1]), text("t = $(round(ts[k], digits=2)) s", 9))
-        annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.12 * (ylims_anim[2] - ylims_anim[1]), text("B = $(round(Bcrit_hist[min(max(k - 1, 1), end)], digits=3))", 9))
-        mode_str = (k > 1 && barrier_override_hist[min(k - 1, end)]) ? "override" : "nominal"
-        annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.18 * (ylims_anim[2] - ylims_anim[1]), text("mode = $mode_str", 9))
-        p
+        p_B = plot(ts, Bcrit_hist, lw=2.2, color=:dodgerblue3,
+            label="active barrier", xlabel="time", ylabel="B", title="Barrier margin", legend=:bottomright)
+        hline!(p_B, [0.0], color=:orangered2, ls=:dash, lw=1.8, label="0")
+        hline!(p_B, [-delta], color=:forestgreen, ls=:dot, lw=1.8, label="-δ")
+        hline!(p_B, [-(delta + K)], color=:darkorchid2, ls=:dashdot, lw=1.8, label="-δ-K")
+
+        # Replace dense guide lines with compact bottom markers to reduce visual clutter.
+        b_min = minimum(Bcrit_hist)
+        b_max = maximum(Bcrit_hist)
+        b_span = max(b_max - b_min, 1e-3)
+        marker_base = b_min - 0.04 * b_span
+        marker_upper = b_min - 0.015 * b_span
+
+        n_sample_markers = min(length(sample_times), 36)
+        sample_stride = max(1, Int(ceil(length(sample_times) / max(n_sample_markers, 1))))
+        sample_marker_times = sample_times[1:sample_stride:end]
+        scatter!(p_B, sample_marker_times, fill(marker_base, length(sample_marker_times));
+            ms=1.6, marker=:circle, color=:gray55, alpha=0.35, label=false)
+
+        override_times = ts[barrier_override_hist]
+        if !isempty(override_times)
+            n_override_markers = min(length(override_times), 60)
+            override_stride = max(1, Int(ceil(length(override_times) / max(n_override_markers, 1))))
+            override_marker_times = override_times[1:override_stride:end]
+            scatter!(p_B, override_marker_times, fill(marker_upper, length(override_marker_times));
+                ms=2.0, marker=:utriangle, color=:darkorange2, alpha=0.60, markerstrokewidth=0.0, label="override markers")
+        end
+
+        u1_nominal_only = [barrier_override_hist[i] ? NaN : u_app_hist[1, i] for i in eachindex(ts)]
+        u1_override_only = [barrier_override_hist[i] ? u_app_hist[1, i] : NaN for i in eachindex(ts)]
+        u2_nominal_only = [barrier_override_hist[i] ? NaN : u_app_hist[2, i] for i in eachindex(ts)]
+        u2_override_only = [barrier_override_hist[i] ? u_app_hist[2, i] : NaN for i in eachindex(ts)]
+
+        p_u = plot(
+            ts,
+            u1_nominal_only,
+            lw=2.0,
+            color=:deepskyblue3,
+            label="u1 applied (nominal mode)",
+            xlabel="time",
+            ylabel="control",
+            title="Applied controls by mode",
+            legend=:bottomright,
+        )
+        plot!(p_u, ts, u1_override_only, lw=2.0, color=:orangered3, label="u1 applied (override mode)")
+        plot!(p_u, ts, u2_nominal_only, lw=1.8, color=:teal, ls=:dash, label="u2 applied (nominal mode)")
+        plot!(p_u, ts, u2_override_only, lw=1.8, color=:orange, ls=:dash, label="u2 applied (override mode)")
+        for (a, b) in override_spans
+            vspan!(p_u, [a, b], color=:gray85, alpha=0.35, label=false)
+        end
+
+        p_combined = plot(
+            p_traj, p_B, p_u,
+            layout=@layout([a{0.95w} ; b{0.6w} ; c{0.55w}]),
+            size=(900, 1100),
+        )
+
+        mkpath("figures")
+        savefig(p_traj, "figures/multirotor_traj.pdf")
+        savefig(p_B, "figures/multirotor_barrier.pdf")
+        savefig(p_u, "figures/multirotor_control.pdf")
+        savefig(p_combined, "figures/multirotor_results_combined.pdf")
+
+        x_all = vcat(X[1, :], obs_x)
+        y_all = vcat(X[2, :], obs_y)
+        x_margin = 0.15 * max(maximum(x_all) - minimum(x_all), 1.0)
+        y_margin = 0.15 * max(maximum(y_all) - minimum(y_all), 1.0)
+        xlims_anim = (minimum(x_all) - x_margin, maximum(x_all) + x_margin)
+        ylims_anim = (minimum(y_all) - y_margin, maximum(y_all) + y_margin)
+
+        obs_radius = alpha
+        θ = LinRange(0, 2pi, 160)
+
+        anim = @animate for k in 1:4:N
+            p = plot(xlim=xlims_anim, ylim=ylims_anim, aspect_ratio=:equal, xlabel="x", ylabel="y", title="Repulsive barrier simulation (moving obstacle)")
+            plot!(p, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray, label="reference")
+            plot!(p, X[1, 1:k], X[2, 1:k], label="system", lw=2.5, color=:blue)
+            if k > 1 && barrier_override_hist[min(k - 1, end)]
+                scatter!(p, [X[1, k]], [X[2, k]], label="barrier override", color=:red, markersize=5)
+            else
+                scatter!(p, [X[1, k]], [X[2, k]], label="state", color=:blue, markersize=5)
+            end
+
+            cx, cy = obs_x[k], obs_y[k]
+            hx, hy = obs_hat_x[k], obs_hat_y[k]
+            obs_px = cx .+ obs_radius .* cos.(θ)
+            obs_py = cy .+ obs_radius .* sin.(θ)
+            plot!(p, obs_px, obs_py, label="obstacle", lw=2, color=:black)
+            scatter!(p, [cx], [cy], label="obs center", color=:black, markersize=4)
+            scatter!(p, [hx], [hy], label="recentered", marker=:x, color=:magenta, markersize=5)
+            annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.06 * (ylims_anim[2] - ylims_anim[1]), text("t = $(round(ts[k], digits=2)) s", 9))
+            annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.12 * (ylims_anim[2] - ylims_anim[1]), text("B = $(round(Bcrit_hist[min(max(k - 1, 1), end)], digits=3))", 9))
+            mode_str = (k > 1 && barrier_override_hist[min(k - 1, end)]) ? "override" : "nominal"
+            annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.18 * (ylims_anim[2] - ylims_anim[1]), text("mode = $mode_str", 9))
+            p
+        end
+        mkpath(dirname(gif_file))
+        gif(anim, gif_file, fps=20)
     end
-    mkpath(dirname(gif_file))
-    gif(anim, gif_file, fps=20)
 
     println("Simulation finished")
     println("minimum recentered barrier value = ", minimum(Bcrit_hist))
@@ -414,11 +602,18 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
     println("mean tracking error = ", mean(track_err_hist))
     println("max tracking error = ", maximum(track_err_hist))
     println("number of barrier overrides = ", n_override)
+    println("override enter threshold = ", enter_thresh)
+    println("override exit threshold = ", exit_thresh)
+    println("override distance trigger = ", override_dist_trigger)
+    println("override distance release = ", dist_release)
+    println("strict delta enforcement = ", strict_delta_enforcement)
     println("Animation saved to ", gif_file)
 
-    p_anim = plot(X[1, :], X[2, :], lw=2.5, label="trajectory preview", aspect_ratio=1)
-    plot!(p_anim, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, label="reference")
-    plot!(p_anim, title="Preview (full animation is in GIF)", xlabel="x", ylabel="y")
+    if make_plots
+        p_anim = plot(X[1, :], X[2, :], lw=2.5, label="trajectory preview", aspect_ratio=1)
+        plot!(p_anim, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, label="reference")
+        plot!(p_anim, title="Preview (full animation is in GIF)", xlabel="x", ylabel="y")
+    end
 
     return (
         ts = ts,
@@ -435,6 +630,8 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
         obs_hat_hist = obs_hat_hist,
         ref_hist = ref_hist,
         min_dist_to_obs = min_dist_to_obs,
+        mean_track_err = mean(track_err_hist),
+        max_track_err = maximum(track_err_hist),
         collision = collision,
         p_traj = p_traj,
         p_B = p_B,
