@@ -555,31 +555,92 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
         ylims_anim = (minimum(y_all) - y_margin, maximum(y_all) + y_margin)
 
         obs_radius = alpha
-        θ = LinRange(0, 2pi, 160)
+        θ = LinRange(0, 2pi, 120)
+        u_min = minimum(u_app_hist)
+        u_max = maximum(u_app_hist)
+        u_span = max(u_max - u_min, 1e-3)
+        u_pad = 0.10 * u_span
+        b_pad = 0.08 * b_span
 
         anim = @animate for k in 1:4:N
-            p = plot(xlim=xlims_anim, ylim=ylims_anim, aspect_ratio=:equal, xlabel="x", ylabel="y", title="Repulsive barrier simulation (moving obstacle)")
-            plot!(p, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray, label="reference")
-            plot!(p, X[1, 1:k], X[2, 1:k], label="system", lw=2.5, color=:blue)
-            if k > 1 && barrier_override_hist[min(k - 1, end)]
-                scatter!(p, [X[1, k]], [X[2, k]], label="barrier override", color=:red, markersize=5)
+            kh = min(max(k, 1), length(ts))
+            t_now = ts[kh]
+
+            p_ws = plot(
+                xlim=xlims_anim,
+                ylim=ylims_anim,
+                aspect_ratio=:equal,
+                xlabel="x",
+                ylabel="y",
+                title="Workspace",
+                legend=:bottomleft,
+            )
+            plot!(p_ws, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray45, label="reference")
+            plot!(p_ws, X[1, 1:kh], X[2, 1:kh], label="trajectory", lw=2.5, color=:dodgerblue3)
+            if kh > 1 && barrier_override_hist[min(kh - 1, end)]
+                scatter!(p_ws, [X[1, kh]], [X[2, kh]], label="override", color=:orangered3, markersize=5)
             else
-                scatter!(p, [X[1, k]], [X[2, k]], label="state", color=:blue, markersize=5)
+                scatter!(p_ws, [X[1, kh]], [X[2, kh]], label="state", color=:dodgerblue3, markersize=5)
             end
 
-            cx, cy = obs_x[k], obs_y[k]
-            hx, hy = obs_hat_x[k], obs_hat_y[k]
+            cx, cy = obs_x[kh], obs_y[kh]
+            hx, hy = obs_hat_x[kh], obs_hat_y[kh]
             obs_px = cx .+ obs_radius .* cos.(θ)
             obs_py = cy .+ obs_radius .* sin.(θ)
-            plot!(p, obs_px, obs_py, seriestype=:shape, color=:orange, fillalpha=0.12, linealpha=0.0, label=false)
-            plot!(p, obs_px, obs_py, label="obstacle (r = α)", lw=2, color=:black)
-            scatter!(p, [cx], [cy], label="obs center", color=:black, markersize=4)
-            scatter!(p, [hx], [hy], label="recentered", marker=:x, color=:magenta, markersize=5)
-            annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.06 * (ylims_anim[2] - ylims_anim[1]), text("t = $(round(ts[k], digits=2)) s", 9))
-            annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.12 * (ylims_anim[2] - ylims_anim[1]), text("B = $(round(Bcrit_hist[min(max(k - 1, 1), end)], digits=3))", 9))
-            mode_str = (k > 1 && barrier_override_hist[min(k - 1, end)]) ? "override" : "nominal"
-            annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.18 * (ylims_anim[2] - ylims_anim[1]), text("mode = $mode_str", 9))
-            p
+            plot!(p_ws, obs_px, obs_py, seriestype=:shape, color=:orange, fillalpha=0.12, linealpha=0.0, label=false)
+            plot!(p_ws, obs_px, obs_py, label="obstacle (r = α)", lw=2, color=:black)
+            scatter!(p_ws, [cx], [cy], label="obs center", color=:black, markersize=4)
+            scatter!(p_ws, [hx], [hy], label="recentered", marker=:x, color=:darkmagenta, markersize=5)
+
+            annotate!(p_ws, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.06 * (ylims_anim[2] - ylims_anim[1]), text("t = $(round(t_now, digits=2)) s", 9))
+            annotate!(p_ws, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.12 * (ylims_anim[2] - ylims_anim[1]), text("B = $(round(Bcrit_hist[kh], digits=3))", 9))
+            mode_str = (kh > 1 && barrier_override_hist[min(kh - 1, end)]) ? "override" : "nominal"
+            annotate!(p_ws, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.18 * (ylims_anim[2] - ylims_anim[1]), text("mode = $mode_str", 9))
+
+            p_B_anim = plot(
+                xlabel="time",
+                ylabel="B",
+                xlims=(ts[1], ts[end]),
+                ylims=(b_min - b_pad, b_max + b_pad),
+                title="Barrier evolution",
+                legend=:topright,
+            )
+            plot!(p_B_anim, ts, Bcrit_hist, lw=1.2, color=:gray70, alpha=0.55, label=false)
+            plot!(p_B_anim, ts[1:kh], Bcrit_hist[1:kh], lw=2.4, color=:dodgerblue3, label="B(t)")
+            scatter!(p_B_anim, [ts[kh]], [Bcrit_hist[kh]], color=:dodgerblue4, markersize=4, label=false)
+            hline!(p_B_anim, [0.0], color=:orangered2, ls=:dash, lw=1.6, label="0")
+            hline!(p_B_anim, [-delta], color=:forestgreen, ls=:dot, lw=1.6, label="-δ")
+            hline!(p_B_anim, [-(delta + K)], color=:darkorchid2, ls=:dashdot, lw=1.6, label="-δ-K")
+            vline!(p_B_anim, [t_now], color=:black, ls=:dot, lw=1.2, alpha=0.55, label=false)
+
+            u1_nom_anim = [barrier_override_hist[i] ? NaN : u_app_hist[1, i] for i in 1:kh]
+            u1_ovr_anim = [barrier_override_hist[i] ? u_app_hist[1, i] : NaN for i in 1:kh]
+            u2_nom_anim = [barrier_override_hist[i] ? NaN : u_app_hist[2, i] for i in 1:kh]
+            u2_ovr_anim = [barrier_override_hist[i] ? u_app_hist[2, i] : NaN for i in 1:kh]
+
+            p_u_anim = plot(
+                xlabel="time",
+                ylabel="control",
+                xlims=(ts[1], ts[end]),
+                ylims=(u_min - u_pad, u_max + u_pad),
+                title="Applied controls",
+                legend=:bottomright,
+            )
+            plot!(p_u_anim, ts, u_app_hist[1, :], lw=1.2, color=:gray70, alpha=0.45, label=false)
+            plot!(p_u_anim, ts, u_app_hist[2, :], lw=1.2, color=:gray70, alpha=0.45, ls=:dash, label=false)
+            plot!(p_u_anim, ts[1:kh], u1_nom_anim, lw=2.2, color=:deepskyblue3, label="u1 nominal")
+            plot!(p_u_anim, ts[1:kh], u1_ovr_anim, lw=2.2, color=:orangered3, label="u1 override")
+            plot!(p_u_anim, ts[1:kh], u2_nom_anim, lw=1.9, color=:teal, ls=:dash, label="u2 nominal")
+            plot!(p_u_anim, ts[1:kh], u2_ovr_anim, lw=1.9, color=:orange, ls=:dash, label="u2 override")
+            vline!(p_u_anim, [t_now], color=:black, ls=:dot, lw=1.2, alpha=0.55, label=false)
+
+            plot(
+                p_ws,
+                p_B_anim,
+                p_u_anim,
+                layout=@layout([a{0.52w} [b; c]]),
+                size=(1280, 720),
+            )
         end
         mkpath(dirname(gif_file))
         gif(anim, gif_file, fps=20)
