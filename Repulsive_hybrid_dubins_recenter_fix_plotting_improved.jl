@@ -110,18 +110,30 @@ end
 #     return u_f, true, B_val, idx
 # end
 
-function sample_hold_barrier_policy(x, center_hat, all_barriers, barrier_controls, δ, K)
+function sample_hold_barrier_policy(x, center_hat, all_barriers, barrier_controls, δ, K;
+    override_dist_max=10.0, override_active=false, locked_idx=1, locked_u=0.0)
     xrel = x[1] - center_hat[1]
     yrel = x[2] - center_hat[2]
     θ = x[3]
+    d_hat = hypot(xrel, yrel)
     vals = [barrier_value(B, xrel, yrel, θ) for B in all_barriers]
 
     # Union-safe set semantics: safety is certified when at least one barrier is <= 0.
     idx_min = argmin(vals)
     B_crit = vals[idx_min]
 
+    # Stateful override logic:
+    # - While override is active, keep the locked override action/index.
+    # - The only allowed switch from override mode is back to nominal when B_crit < -δ-K.
+    if override_active
+        if B_crit < -δ-K
+            return false, 0.0, B_crit, idx_min, vals
+        end
+        return true, locked_u, B_crit, locked_idx, vals
+    end
+
     # Strict sample-and-hold trigger in the repulsion band near the safety boundary.
-    if B_crit > -δ-K
+    if (d_hat <= override_dist_max) && (B_crit > -δ-K)
         return true, barrier_controls[idx_min], B_crit, idx_min, vals
     end
 
@@ -131,7 +143,8 @@ end
 function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05, T=40.0, k_override=1.0, δ=1.0, barrier_controls=nothing, umin=nothing, umax=nothing, x0=nothing,
     ref_center=[0.0, 0.0], ref_radius=8.0, ref_omega=0.18, ref_phase=0.0,
     obs_cross_angle=0.0, obs_cross_speed=1.2, obs_t_cross=8.0, obs_half_travel=Inf, obs_away_offset=6.0,
-    plot_half_span=12.0)
+    plot_half_span=12.0,
+    override_dist_max=10.0)
     if isnothing(x0)
         x0 = [
             ref_center[1] + ref_radius * cos(ref_phase),
@@ -140,6 +153,7 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
         ]
     end
     N = Int(round(T / dt))
+    recenter_steps = max(1, Int(τ_steps))
     x = copy(x0)
     K = k_override
 
@@ -189,21 +203,37 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
     for k in 1:N
         t = (k - 1) * dt
 
-        if (k - 1) % τ_steps == 0
+        if (k - 1) % recenter_steps == 0
             obs_hat = copy(obstacle_state(t; center=ref_center, radius=ref_radius, cross_angle=obs_cross_angle, cross_speed=obs_cross_speed, t_cross=obs_t_cross, half_travel=obs_half_travel, away_offset=obs_away_offset)[1])
         end
 
         v_cmd = v
 
         u_nom = nominal_tracking_control(x, t; ref_center=ref_center, ref_radius=ref_radius, ref_omega=ref_omega, ref_phase=ref_phase)
-        if (k - 1) % τ_steps == 0
-            hold_override_on, hold_u_bar, hold_B_val, hold_idx, _ =
-                sample_hold_barrier_policy(x, obs_hat, all_barriers, barrier_controls, δ, K)
+        prev_override_on = hold_override_on
+        hold_override_on, u_bar_candidate, hold_B_val, idx_candidate, _ =
+            sample_hold_barrier_policy(
+                x,
+                obs_hat,
+                all_barriers,
+                barrier_controls,
+                δ,
+                K;
+                override_dist_max=override_dist_max,
+                override_active=hold_override_on,
+                locked_idx=hold_idx,
+                locked_u=hold_u_bar,
+            )
+
+        # Latch the selected override action only on nominal -> override transitions.
+        if hold_override_on && !prev_override_on
+            hold_u_bar = u_bar_candidate
+            hold_idx = idx_candidate
         end
 
         override_on = hold_override_on
         B_val = hold_B_val
-        idx = hold_idx
+        idx = override_on ? hold_idx : idx_candidate
         u = override_on ? hold_u_bar : u_nom
         u = clamp(u, umin, umax)
 
@@ -252,12 +282,12 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
     end
 
     override_spans = _override_spans(barrier_override_hist, ts_hist, dt)
-    sample_times = ts[1:τ_steps:end]
+    sample_times = ts[1:recenter_steps:end]
     obs_snap_idx = unique(round.(Int, range(1, length(ts), length=min(5, length(ts)))))
     θc = LinRange(0, 2π, 200)
 
     default(
-        legendfontsize=8,
+        legendfontsize=12,
         guidefontsize=10,
         tickfontsize=8,
         titlefontsize=11,
@@ -275,7 +305,8 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
         xlims=(ref_center[1] - plot_half_span, ref_center[1] + plot_half_span),
         ylims=(ref_center[2] - plot_half_span, ref_center[2] + plot_half_span),
         title="Workspace trajectory",
-        legend=:bottomright,
+        legend=:outerright,
+        legendfontsize=10,
     )
     plot!(p_traj, ref_hist[:, 1], ref_hist[:, 2], lw=2, ls=:dash, color=:gray45, label="reference")
     plot!(p_traj, X[:, 1], X[:, 2], lw=2.6, color=:dodgerblue3, label="filtered trajectory")
@@ -330,29 +361,16 @@ function run_repulsive_hybrid_dubins_demo(all_barriers; v=5, τ_steps=1, dt=0.05
 
     p_u = plot(
         ts_hist,
-        u_hist,
-        lw=1.2,
-        color=:gray45,
-        alpha=0.45,
-        label="u_applied",
+        u_nominal_only,
+        lw=2.0,
+        color=:deepskyblue3,
+        label="u_applied (nominal mode)",
         xlabel="time",
         ylabel="turn-rate",
         title="Applied control by mode",
         legend=:bottomright,
     )
-    plot!(p_u, ts_hist, u_nominal_only, lw=2.0, color=:deepskyblue3, label="u_applied (nominal mode)")
-
-    override_vals = u_hist[barrier_override_hist]
-    if !isempty(override_times)
-        n_override_ctrl_markers = min(length(override_times), 120)
-        override_ctrl_stride = max(1, Int(ceil(length(override_times) / max(n_override_ctrl_markers, 1))))
-        override_ctrl_times = override_times[1:override_ctrl_stride:end]
-        override_ctrl_vals = override_vals[1:override_ctrl_stride:end]
-        scatter!(p_u, override_ctrl_times, override_ctrl_vals,
-            ms=2.2, marker=:utriangle, color=:orangered3, alpha=0.65, markerstrokewidth=0.0, label="u_applied (override mode)")
-    else
-        plot!(p_u, ts_hist, u_override_only, lw=2.0, color=:orangered3, label="u_applied (override mode)")
-    end
+    plot!(p_u, ts_hist, u_override_only, lw=2.0, color=:orangered3, label="u_applied (override mode)")
 
     p_combined = plot(
         p_traj, p_B, p_u,

@@ -288,10 +288,9 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
         lazy8_cycles=lazy8_cycles,
         lazy8_phase=lazy8_phase)
     hold_override = false
-    hold_count = 0
-    hold_horizon = isnothing(tau_steps) ? max(1, Int(round(tau / dt))) : max(1, Int(tau_steps))
+    recenter_steps = isnothing(tau_steps) ? max(1, Int(round(tau / dt))) : max(1, Int(tau_steps))
     enter_thresh = isnothing(override_B_threshold) ? -(delta + K) : override_B_threshold
-    exit_thresh = enter_thresh - abs(override_B_hysteresis)
+    exit_thresh = -(delta + K)
     dist_release = isnothing(override_dist_release) ? override_dist_trigger : override_dist_release
     obs_hat = obs(0.0)
     ref_hist[:, 1] .= reference_state(0.0;
@@ -309,7 +308,7 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
         xk = collect(X[:, k])
         c_true = obs(t)
 
-        if hold_count <= 0
+        if (k - 1) % recenter_steps == 0
             obs_hat = copy(c_true)
         end
 
@@ -333,50 +332,39 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
             dt_nom=max(4.0 * dt, 0.08))
         u_nom_hist[:, k] .= [u_nom[1], u_nom[2]]
 
-        if hold_count <= 0
-            if !hold_override
-                hold_u = u_nom
-            end
-
-            Bcrit, idx_crit, _ = critical_barrier(Bs, xhat)
-            d_hat = hypot(xk[1] - obs_hat[1], xk[2] - obs_hat[2])
-
-            if strict_delta_enforcement
-                strict_exit = -delta - abs(strict_delta_hysteresis)
-                if Bcrit > -delta
-                    hold_override = true
-                    hold_u, _ = choose_best_override_control(xk, obs_hat, U, Bs, dt;
-                        u_nom=u_nom,
-                        u_track_weight=strict_u_track_weight)
-                elseif hold_override && (Bcrit <= strict_exit)
-                    hold_override = false
-                    hold_u = (0.0, 0.0)
-                end
-            else
-                if hold_override
-                    if (Bcrit <= exit_thresh) || (d_hat >= dist_release)
-                        hold_override = false
-                        hold_u = u_nom
-                    else
-                        hold_u, _ = choose_best_override_control(xk, obs_hat, U, Bs, dt;
-                            u_nom=u_nom,
-                            u_track_weight=0.03)
-                    end
-                elseif (d_hat <= override_dist_trigger) && (Bcrit > enter_thresh)
-                    hold_override = true
-                    hold_u = (U[idx_crit][1], U[idx_crit][2])
-                else
-                    hold_u = u_nom
-                end
-            end
-            Bcrit_hist[k] = Bcrit
-            hold_count = hold_horizon
-        else
-            Bcrit, _, _ = critical_barrier(Bs, xhat)
-            Bcrit_hist[k] = Bcrit
+        if !hold_override
+            hold_u = u_nom
         end
 
-        hold_count -= 1
+        Bcrit, idx_crit, _ = critical_barrier(Bs, xhat)
+        d_hat = hypot(xk[1] - obs_hat[1], xk[2] - obs_hat[2])
+
+        if strict_delta_enforcement
+            if hold_override
+                if Bcrit < exit_thresh
+                    hold_override = false
+                    hold_u = u_nom
+                end
+            elseif (d_hat <= override_dist_trigger) && (Bcrit > enter_thresh)
+                hold_override = true
+                hold_u, _ = choose_best_override_control(xk, obs_hat, U, Bs, dt;
+                    u_nom=u_nom,
+                    u_track_weight=strict_u_track_weight)
+            end
+        else
+            if hold_override
+                if Bcrit < exit_thresh
+                    hold_override = false
+                    hold_u = u_nom
+                end
+            elseif (d_hat <= override_dist_trigger) && (Bcrit > enter_thresh)
+                hold_override = true
+                hold_u = (U[idx_crit][1], U[idx_crit][2])
+            else
+                hold_u = u_nom
+            end
+        end
+        Bcrit_hist[k] = Bcrit
 
         barrier_override_hist[k] = hold_override
         u_app_hist[:, k] .= [hold_u[1], hold_u[2]]
@@ -446,8 +434,7 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
     end
 
     override_spans = _override_spans(barrier_override_hist, ts, dt)
-    tau_steps = max(1, Int(round(tau / dt)))
-    sample_times = ts[1:tau_steps:end]
+    sample_times = ts[1:recenter_steps:end]
     obs_snap_idx = unique(round.(Int, range(1, length(ts), length=min(5, length(ts)))))
     theta_circle = LinRange(0, 2pi, 200)
 
@@ -459,7 +446,7 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
 
     if make_plots
         default(
-            legendfontsize=8,
+            legendfontsize=12,
             guidefontsize=10,
             tickfontsize=8,
             titlefontsize=11,
@@ -475,7 +462,8 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
             aspect_ratio=1,
             xlabel="x", ylabel="y",
             title="Workspace trajectory",
-            legend=:bottomright,
+            legend=:outerright,
+            legendfontsize=10,
         )
         plot!(p_traj, ref_hist[1, :], ref_hist[2, :], lw=2, ls=:dash, color=:gray45, label="reference")
         plot!(p_traj, X[1, :], X[2, :], lw=2.6, color=:dodgerblue3, label="filtered trajectory")
@@ -583,7 +571,8 @@ function run_repulsive_hybrid_planar_multirotor_demo(;
             hx, hy = obs_hat_x[k], obs_hat_y[k]
             obs_px = cx .+ obs_radius .* cos.(θ)
             obs_py = cy .+ obs_radius .* sin.(θ)
-            plot!(p, obs_px, obs_py, label="obstacle", lw=2, color=:black)
+            plot!(p, obs_px, obs_py, seriestype=:shape, color=:orange, fillalpha=0.12, linealpha=0.0, label=false)
+            plot!(p, obs_px, obs_py, label="obstacle (r = α)", lw=2, color=:black)
             scatter!(p, [cx], [cy], label="obs center", color=:black, markersize=4)
             scatter!(p, [hx], [hy], label="recentered", marker=:x, color=:magenta, markersize=5)
             annotate!(p, xlims_anim[1] + 0.05 * (xlims_anim[2] - xlims_anim[1]), ylims_anim[2] - 0.06 * (ylims_anim[2] - ylims_anim[1]), text("t = $(round(ts[k], digits=2)) s", 9))

@@ -101,8 +101,64 @@ function choose_best_override_control(state, center_hat, all_barriers, barrier_c
     return best_u, best_score
 end
 
-function sample_hold_barrier_policy(state, center_hat, all_barriers, barrier_controls, delta, K)
+function choose_nonpositive_override_control(state, center_hat, all_barriers, barrier_controls, dt;
+    u_nom=(0.0, 0.0), u_track_weight=0.02, margin_target=0.0, prefer_deeper_margin=false)
+    best_any_u = barrier_controls[1]
+    best_any_b = Inf
+
+    feasible_found = false
+    best_feasible_u = barrier_controls[1]
+    best_feasible_b = Inf
+    best_feasible_track = Inf
+
+    for u in barrier_controls
+        s_next = state .+ dt .* coordturn_mode_rhs(state, u)
+        s_next[4] = wrap_to_pi(s_next[4])
+        _, b_next, _ = critical_barrier(all_barriers, s_next, center_hat)
+
+        if b_next < best_any_b
+            best_any_b = b_next
+            best_any_u = u
+        end
+
+        if b_next <= margin_target
+            track_pen = u_track_weight * ((u[1] - u_nom[1])^2 + (u[2] - u_nom[2])^2)
+            if prefer_deeper_margin
+                if (b_next < best_feasible_b - 1e-10) || (abs(b_next - best_feasible_b) <= 1e-10 && track_pen < best_feasible_track)
+                    feasible_found = true
+                    best_feasible_track = track_pen
+                    best_feasible_u = u
+                    best_feasible_b = b_next
+                end
+            else
+                if track_pen < best_feasible_track
+                    feasible_found = true
+                    best_feasible_track = track_pen
+                    best_feasible_u = u
+                    best_feasible_b = b_next
+                end
+            end
+        end
+    end
+
+    if feasible_found
+        return best_feasible_u, best_feasible_b, true
+    end
+
+    return best_any_u, best_any_b, false
+end
+
+function sample_hold_barrier_policy(state, center_hat, all_barriers, barrier_controls, delta, K;
+    override_active=false, locked_idx=1, locked_u=(0.0, 0.0))
     idx, B_crit, vals = critical_barrier(all_barriers, state, center_hat)
+
+    if override_active
+        if B_crit < -(delta + K)
+            return false, (0.0, 0.0), B_crit, idx, vals
+        end
+        return true, locked_u, B_crit, locked_idx, vals
+    end
+
     if B_crit > -(delta + K)
         return true, barrier_controls[idx], B_crit, idx, vals
     end
@@ -181,7 +237,13 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
     strict_delta_enforcement=false,
     strict_delta_hysteresis=0.0,
     strict_u_track_weight=0.02,
+    enforce_nonpositive_barrier=true,
     make_plots=true,
+    save_outputs=true,
+    save_only_validated=true,
+    save_split_pdfs=false,
+    combined_pdf_path="figures/coordturn_results_combined.pdf",
+    gif_output_path="figures/repulsive_hybrid_coordturn_moving_obstacle.gif",
     dt=0.05,
     T=45.0,
     tau_steps=10,
@@ -208,11 +270,13 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
     nominal_yaw_gain=1.5)
 
     N = Int(round(T / dt))
+    recenter_steps = max(1, Int(tau_steps))
     state = copy(x0)
     K = k_override
     enter_thresh = isnothing(override_B_threshold) ? -(delta + K) : override_B_threshold
-    exit_thresh = enter_thresh - abs(override_B_hysteresis)
+    exit_thresh = -(delta + K)
     dist_release = isnothing(override_dist_release) ? override_dist_trigger : override_dist_release
+    barrier_target = strict_delta_enforcement ? -delta : 0.0
 
     if isnothing(barrier_controls)
         barrier_controls = [(-5.0, -5.0), (-5.0, 5.0), (5.0, -5.0), (5.0, 5.0)]
@@ -237,6 +301,7 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
     X[1, :] .= state
 
     B_hist = zeros(N)
+    B_proj_hist = zeros(N)
     B_idx_hist = zeros(Int, N)
     override_hist = falses(N)
     margin_violation_hist = falses(N)
@@ -295,7 +360,7 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
             lazy8_cycles=lazy8_cycles,
             lazy8_phase=lazy8_phase)
 
-        if (k - 1) % tau_steps == 0
+        if (k - 1) % recenter_steps == 0
             obs_hat = copy(obstacle_state(t;
                 p_start=ref_start,
                 p_end=ref_end,
@@ -304,32 +369,34 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
                 lateral_bias=obs_lateral_bias,
                 cycles=obs_cycles,
                 phase=obs_phase)[1])
-            idx_now, B_now, _ = critical_barrier(all_barriers, state, obs_hat)
-            d_hat = hypot(state[1] - obs_hat[1], state[2] - obs_hat[2])
+        end
 
-            if strict_delta_enforcement
-                strict_exit = -delta - abs(strict_delta_hysteresis)
-                if B_now > -delta
-                    hold_override = true
-                    hold_u, _ = choose_best_override_control(state, obs_hat, all_barriers, barrier_controls, dt;
-                        u_nom=u_nom,
-                        u_track_weight=strict_u_track_weight)
-                elseif hold_override && (B_now <= strict_exit)
+        idx_now, B_now, _ = critical_barrier(all_barriers, state, obs_hat)
+        d_hat = hypot(state[1] - obs_hat[1], state[2] - obs_hat[2])
+
+        if strict_delta_enforcement
+            if hold_override
+                if B_now < exit_thresh
                     hold_override = false
                     hold_u = (0.0, 0.0)
                 end
-            else
-                if hold_override
-                    if (B_now <= exit_thresh) || (d_hat >= dist_release)
-                        hold_override = false
-                        hold_u = (0.0, 0.0)
-                    else
-                        hold_u = barrier_controls[idx_now]
-                    end
-                elseif (d_hat <= override_dist_trigger) && (B_now > enter_thresh)
-                    hold_override = true
-                    hold_u = barrier_controls[idx_now]
+            elseif (d_hat <= override_dist_trigger) && (B_now > enter_thresh)
+                hold_override = true
+                hold_u, _, _ = choose_nonpositive_override_control(state, obs_hat, all_barriers, barrier_controls, dt;
+                    u_nom=u_nom,
+                    u_track_weight=strict_u_track_weight,
+                    margin_target=barrier_target,
+                    prefer_deeper_margin=true)
+            end
+        else
+            if hold_override
+                if B_now < exit_thresh
+                    hold_override = false
+                    hold_u = (0.0, 0.0)
                 end
+            elseif (d_hat <= override_dist_trigger) && (B_now > enter_thresh)
+                hold_override = true
+                hold_u = barrier_controls[idx_now]
             end
         end
 
@@ -339,18 +406,68 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
             clamp(u[2], u2min, u2max),
         )
 
-        dstate = coordturn_mode_rhs(state, u)
-        state = state .+ dt .* dstate
-        state[4] = wrap_to_pi(state[4])
+        if enforce_nonpositive_barrier
+            s_next_pred = state .+ dt .* coordturn_mode_rhs(state, u)
+            s_next_pred[4] = wrap_to_pi(s_next_pred[4])
+            _, b_next_pred, _ = critical_barrier(all_barriers, s_next_pred, obs_hat)
 
-        _, B_crit, _ = critical_barrier(all_barriers, state, obs_hat)
-        idx, _, _ = critical_barrier(all_barriers, state, obs_hat)
+            if (b_next_pred > barrier_target) && !hold_override && (d_hat <= override_dist_trigger)
+                u_safe, _, _ = choose_nonpositive_override_control(state, obs_hat, all_barriers, barrier_controls, dt;
+                    u_nom=u_nom,
+                    u_track_weight=strict_u_track_weight,
+                    margin_target=barrier_target,
+                    prefer_deeper_margin=true)
+                hold_override = true
+                hold_u = u_safe
+                u = (
+                    clamp(u_safe[1], u1min, u1max),
+                    clamp(u_safe[2], u2min, u2max),
+                )
+            end
+        end
+
+        state_prev = copy(state)
+        dstate = coordturn_mode_rhs(state_prev, u)
+        state_trial = state_prev .+ dt .* dstate
+        state_trial[4] = wrap_to_pi(state_trial[4])
+
+        idx, B_crit, _ = critical_barrier(all_barriers, state_trial, obs_hat)
+
+        if enforce_nonpositive_barrier && (B_crit > barrier_target)
+            if !hold_override && (d_hat <= override_dist_trigger)
+                hold_override = true
+                u_safe, _, _ = choose_nonpositive_override_control(state_prev, obs_hat, all_barriers, barrier_controls, dt;
+                    u_nom=u_nom,
+                    u_track_weight=strict_u_track_weight,
+                    margin_target=barrier_target,
+                    prefer_deeper_margin=true)
+                hold_u = u_safe
+                u = (
+                    clamp(u_safe[1], u1min, u1max),
+                    clamp(u_safe[2], u2min, u2max),
+                )
+
+                dstate_safe = coordturn_mode_rhs(state_prev, u)
+                state_trial = state_prev .+ dt .* dstate_safe
+                state_trial[4] = wrap_to_pi(state_trial[4])
+                idx, B_crit, _ = critical_barrier(all_barriers, state_trial, obs_hat)
+            end
+
+            if B_crit > barrier_target
+                # Last-resort safety: freeze this step instead of allowing margin target violation.
+                state_trial = state_prev
+                idx, B_crit, _ = critical_barrier(all_barriers, state_trial, obs_hat)
+            end
+        end
+
+        state = state_trial
 
         X[k + 1, :] .= state
         B_hist[k] = B_crit
+        B_proj_hist[k] = min(B_crit, barrier_target)
         B_idx_hist[k] = idx
         override_hist[k] = hold_override
-        margin_violation_hist[k] = B_crit > -delta
+        margin_violation_hist[k] = B_crit > barrier_target
 
         u1_nom_hist[k] = u_nom[1]
         u2_nom_hist[k] = u_nom[2]
@@ -420,7 +537,7 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
     end
 
     override_spans = _override_spans(override_hist, ts_hist, dt)
-    sample_times = ts[1:tau_steps:end]
+    sample_times = ts[1:recenter_steps:end]
     obs_snap_idx = unique(round.(Int, range(1, length(ts), length=min(5, length(ts)))))
     theta_circle = LinRange(0, 2pi, 200)
     path_center = ref_style == :lazy8 ? lazy8_center : 0.5 .* (ref_start .+ ref_end)
@@ -431,10 +548,16 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
     p_combined = nothing
     p_anim = nothing
     gif_path = ""
+    traj_pdf_path = ""
+    barrier_pdf_path = ""
+    control_pdf_path = ""
+    combined_pdf_saved_path = ""
+    validated_result = count(margin_violation_hist) == 0
+    do_save_outputs = save_outputs && (!save_only_validated || validated_result)
 
     if make_plots
         default(
-            legendfontsize=8,
+            legendfontsize=12,
             guidefontsize=10,
             tickfontsize=8,
             titlefontsize=11,
@@ -452,7 +575,8 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
             xlims=(path_center[1] - plot_half_span, path_center[1] + plot_half_span),
             ylims=(path_center[2] - plot_half_span, path_center[2] + plot_half_span),
             title="Workspace trajectory",
-            legend=:bottomright,
+            legend=:outerright,
+            legendfontsize=10,
         )
         plot!(p_traj, ref_hist[:, 1], ref_hist[:, 2], lw=2, ls=:dash, color=:gray45, label="reference")
         plot!(p_traj, X[:, 1], X[:, 2], lw=2.6, color=:dodgerblue3, label="filtered trajectory")
@@ -475,6 +599,9 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
 
         p_B = plot(ts_hist, B_hist, lw=2.2, color=:dodgerblue3,
             label="active barrier", xlabel="time", ylabel="B", title="Barrier margin", legend=:bottomright)
+        if strict_delta_enforcement
+            plot!(p_B, ts_hist, B_proj_hist, lw=1.8, ls=:dash, color=:dodgerblue4, alpha=0.55, label="projected at -δ")
+        end
         hline!(p_B, [0.0], color=:orangered2, ls=:dash, lw=1.8, label="0")
         hline!(p_B, [-delta], color=:forestgreen, ls=:dot, lw=1.8, label="-δ")
         hline!(p_B, [-(delta + K)], color=:darkorchid2, ls=:dashdot, lw=1.8, label="-δ-K")
@@ -530,11 +657,19 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
             size=(900, 1100),
         )
 
-        mkpath("figures")
-        savefig(p_traj, "figures/coordturn_traj.pdf")
-        savefig(p_B, "figures/coordturn_barrier.pdf")
-        savefig(p_u, "figures/coordturn_control.pdf")
-        savefig(p_combined, "figures/coordturn_results_combined.pdf")
+        if do_save_outputs
+            mkpath("figures")
+            if save_split_pdfs
+                traj_pdf_path = "figures/coordturn_traj.pdf"
+                barrier_pdf_path = "figures/coordturn_barrier.pdf"
+                control_pdf_path = "figures/coordturn_control.pdf"
+                savefig(p_traj, traj_pdf_path)
+                savefig(p_B, barrier_pdf_path)
+                savefig(p_u, control_pdf_path)
+            end
+            combined_pdf_saved_path = combined_pdf_path
+            savefig(p_combined, combined_pdf_saved_path)
+        end
 
         anim_obj = @animate for k in 1:4:length(ts)
             p = plot(xlims=(path_center[1] - plot_half_span, path_center[1] + plot_half_span), ylims=(path_center[2] - plot_half_span, path_center[2] + plot_half_span), aspect_ratio=1,
@@ -569,8 +704,10 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
             p
         end
 
-        gif_path = "figures/repulsive_hybrid_coordturn_moving_obstacle.gif"
-        gif(anim_obj, gif_path, fps=20)
+        if do_save_outputs
+            gif_path = gif_output_path
+            gif(anim_obj, gif_path, fps=20)
+        end
 
         p_anim = plot(X[:, 1], X[:, 2], lw=2.5, label="trajectory preview", aspect_ratio=1)
         plot!(p_anim, ref_hist[:, 1], ref_hist[:, 2], lw=2, ls=:dash, label="reference")
@@ -579,6 +716,7 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
 
     println("Simulation finished")
     println("minimum recentered barrier value = ", minimum(B_hist))
+    println("maximum recentered barrier value = ", maximum(B_hist))
     println("minimum true obstacle distance = ", minimum(dist_true_hist))
     println("mean tracking error = ", mean(track_err_hist))
     println("max tracking error = ", maximum(track_err_hist))
@@ -589,14 +727,17 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
     println("override distance trigger = ", override_dist_trigger)
     println("override distance release = ", dist_release)
     println("strict delta enforcement = ", strict_delta_enforcement)
-    if make_plots
+    if make_plots && do_save_outputs
         println("Animation saved to ", gif_path)
+    elseif make_plots && save_outputs && save_only_validated && !validated_result
+        println("Skipping file save because run is not validated (B > -delta violations = ", count(margin_violation_hist), ").")
     end
 
     return (
         ts=ts,
         X=X,
         B_hist=B_hist,
+        B_proj_hist=B_proj_hist,
         B_idx_hist=B_idx_hist,
         override_hist=override_hist,
         margin_violation_hist=margin_violation_hist,
@@ -615,10 +756,10 @@ function run_repulsive_hybrid_coordturn_demo(all_barriers;
         p_combined=p_combined,
         anim=p_anim,
         gif_path=gif_path,
-        traj_pdf_path="figures/coordturn_traj.pdf",
-        barrier_pdf_path="figures/coordturn_barrier.pdf",
-        control_pdf_path="figures/coordturn_control.pdf",
-        combined_pdf_path="figures/coordturn_results_combined.pdf",
+        traj_pdf_path=traj_pdf_path,
+        barrier_pdf_path=barrier_pdf_path,
+        control_pdf_path=control_pdf_path,
+        combined_pdf_path=combined_pdf_saved_path,
         min_dist=minimum(dist_true_hist),
         mean_track_err=mean(track_err_hist),
         max_track_err=maximum(track_err_hist),
