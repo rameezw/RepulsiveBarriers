@@ -12,3 +12,7 @@
 6. All plots are saved in the 'figures' folder
 
 ![til](./figures/repulsive_hybrid_dubins_moving_obstacle.gif)
+
+![til](./figures/repulsive_hybrid_coordturn_best_available_nonvalidated_3panel.gif)
+
+![til](./figures/repulsive_hybrid_planar_multirotor.gif)
